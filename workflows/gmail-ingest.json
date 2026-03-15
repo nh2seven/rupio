@@ -1,0 +1,304 @@
+{
+  "name": "Finance — Gmail cross-verification ingest",
+  "nodes": [
+    {
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "name": "Fetch Gmail emails",
+      "type": "n8n-nodes-base.gmail",
+      "parameters": {
+        "operation": "getAll",
+        "filters": {
+          "q": "from:(noreply@google.com OR no-reply@steampowered.com OR noreply@swiggy.in OR noreply@zomato.com OR noreply@amazon.in OR donotreply@hdfcbank.com) newer_than:1h"
+        },
+        "options": {
+          "format": "full"
+        }
+      },
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "name": "Check already ingested",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM raw_events WHERE message_id = $1",
+        "additionalFields": {
+          "queryParams": "={{ [$json.id] }}"
+        }
+      },
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "name": "Skip if exists",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.length }}",
+              "operator": {
+                "type": "number",
+                "operation": "equal"
+              },
+              "rightValue": 0
+            }
+          ]
+        }
+      },
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "name": "Insert raw event",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO raw_events (source, message_id, received_at, subject, sender, body_text) VALUES ('gmail', $1, to_timestamp($2::bigint / 1000), $3, $4, $5) RETURNING id",
+        "additionalFields": {
+          "queryParams": "={{ [$json.id, $json.internalDate, $json.payload.headers.find(h => h.name === 'Subject')?.value, $json.payload.headers.find(h => h.name === 'From')?.value, $json.snippet] }}"
+        }
+      },
+      "position": [
+        1120,
+        200
+      ]
+    },
+    {
+      "name": "Regex parse (Gmail)",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Gmail-specific patterns — merchant receipts, Play Store, Steam, etc.\n// Same pattern-loading mechanism as Outlook workflow.\n// Gmail emails are used for cross-verification and merchant enrichment,\n// not as the primary transaction source.\n\nconst body = $('Insert raw event').item.json.snippet || '';\nconst subject = $('Insert raw event').item.json.subject || '';\nconst sender = $('Insert raw event').item.json.sender || '';\nconst rawEventId = $('Insert raw event').item.json.id;\n\nconst patterns = $input.first().json.patterns || [];\n\nfor (const p of patterns) {\n  if (p.source !== 'gmail' && p.source !== 'any') continue;\n  if (p.sender && !sender.includes(p.sender)) continue;\n\n  const re = new RegExp(p.pattern, 'i');\n  const match = body.match(re) || subject.match(re);\n  if (!match || !match.groups) continue;\n\n  const g = match.groups;\n  const amount = parseFloat((g.amount || '').replace(/,/g, ''));\n  if (isNaN(amount)) continue;\n\n  return [{\n    json: {\n      raw_event_id: rawEventId,\n      parse_method: 'regex',\n      pattern_name: p.name,\n      utr: g.utr || g.order_id || null,\n      amount,\n      currency: g.currency || 'INR',\n      direction: g.direction || 'debit',\n      merchant: (g.merchant || '').trim() || null,\n      account: 'gpay',\n      category_hint: (g.merchant || '').trim().toLowerCase() || null,\n      transaction_time: g.date || new Date($('Fetch Gmail emails').item.json.internalDate * 1).toISOString(),\n      parse_success: true,\n      source: 'gmail'\n    }\n  }];\n}\n\nreturn [{ json: { raw_event_id: rawEventId, parse_success: false, source: 'gmail' } }];\n"
+      },
+      "position": [
+        1340,
+        200
+      ]
+    },
+    {
+      "name": "Dedup check",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM dedup_log WHERE utr IS NOT DISTINCT FROM $1 AND amount = $2 AND direction = $3 AND transaction_time = $4::timestamptz AND account IS NOT DISTINCT FROM $5",
+        "additionalFields": {
+          "queryParams": "={{ [$json.utr, $json.amount, $json.direction, $json.transaction_time, $json.account] }}"
+        }
+      },
+      "position": [
+        1560,
+        200
+      ]
+    },
+    {
+      "name": "Is duplicate?",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.length }}",
+              "operator": {
+                "type": "number",
+                "operation": "greaterThan"
+              },
+              "rightValue": 0
+            }
+          ]
+        }
+      },
+      "position": [
+        1780,
+        200
+      ]
+    },
+    {
+      "name": "Enrich existing transaction",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE parsed_transactions SET merchant = COALESCE(merchant, $1), category_hint = COALESCE(category_hint, $2) WHERE id = (SELECT parsed_transaction_id FROM dedup_log WHERE utr IS NOT DISTINCT FROM $3 AND amount = $4 LIMIT 1)",
+        "additionalFields": {
+          "queryParams": "={{ [$json.merchant, $json.category_hint, $json.utr, $json.amount] }}"
+        }
+      },
+      "position": [
+        2000,
+        100
+      ],
+      "notes": "Gmail often has better merchant names. Enrich Outlook-sourced records silently."
+    },
+    {
+      "name": "Write new transaction",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "http://ezbookkeeping:8080/api/v1/transactions/add.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headers": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.ebkApiToken }}"
+            },
+            {
+              "name": "X-Timezone-Name",
+              "value": "Asia/Kolkata"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "body",
+              "value": "={{ JSON.stringify({ type: $json.direction === 'debit' ? 1 : 2, categoryId: $json.ebk_category_id, accountId: $json.ebk_account_id, amount: Math.round($json.amount * 100), comment: $json.merchant, time: new Date($json.transaction_time).getTime() / 1000 }) }}"
+            }
+          ]
+        }
+      },
+      "position": [
+        2000,
+        300
+      ]
+    },
+    {
+      "name": "Log parse failure",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_events (raw_event_id, stage, error_message, raw_payload) VALUES ($1, 'parse', 'Gmail: no regex pattern matched', $2::jsonb)",
+        "additionalFields": {
+          "queryParams": "={{ [$json.raw_event_id, JSON.stringify($json)] }}"
+        }
+      },
+      "position": [
+        1560,
+        400
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Gmail emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Gmail emails": {
+      "main": [
+        [
+          {
+            "node": "Check already ingested",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check already ingested": {
+      "main": [
+        [
+          {
+            "node": "Skip if exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip if exists": {
+      "main": [
+        [
+          {
+            "node": "Insert raw event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Insert raw event": {
+      "main": [
+        [
+          {
+            "node": "Regex parse (Gmail)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Regex parse (Gmail)": {
+      "main": [
+        [
+          {
+            "node": "Dedup check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedup check": {
+      "main": [
+        [
+          {
+            "node": "Is duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Enrich existing transaction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write new transaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

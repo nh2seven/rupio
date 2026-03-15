@@ -1,0 +1,493 @@
+{
+  "name": "Finance — Outlook transaction ingest",
+  "nodes": [
+    {
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "name": "Fetch Outlook emails",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "parameters": {
+        "operation": "getAll",
+        "filters": {
+          "folderId": "Inbox",
+          "subject": "",
+          "receivedAfter": "={{ $now.minus({ hours: 1 }).toISO() }}"
+        },
+        "options": {
+          "fields": "subject,sender,body,receivedDateTime,internetMessageId"
+        }
+      },
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "name": "Filter transaction emails",
+      "type": "n8n-nodes-base.filter",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "combinator": "or"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.sender.emailAddress.address }}",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              },
+              "rightValue": "hdfcbank"
+            },
+            {
+              "leftValue": "={{ $json.sender.emailAddress.address }}",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              },
+              "rightValue": "unionbank"
+            },
+            {
+              "leftValue": "={{ $json.sender.emailAddress.address }}",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              },
+              "rightValue": "google"
+            },
+            {
+              "leftValue": "={{ $json.subject }}",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              },
+              "rightValue": "debited"
+            },
+            {
+              "leftValue": "={{ $json.subject }}",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              },
+              "rightValue": "credited"
+            },
+            {
+              "leftValue": "={{ $json.subject }}",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              },
+              "rightValue": "transaction"
+            }
+          ]
+        }
+      },
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "name": "Check already ingested",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM raw_events WHERE message_id = $1",
+        "additionalFields": {
+          "queryParams": "={{ [$json.internetMessageId] }}"
+        }
+      },
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "name": "Skip if exists",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.length }}",
+              "operator": {
+                "type": "number",
+                "operation": "equal"
+              },
+              "rightValue": 0
+            }
+          ]
+        }
+      },
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "name": "Insert raw event",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO raw_events (source, message_id, received_at, subject, sender, body_text) VALUES ('outlook', $1, $2, $3, $4, $5) RETURNING id",
+        "additionalFields": {
+          "queryParams": "={{ [$('Fetch Outlook emails').item.json.internetMessageId, $('Fetch Outlook emails').item.json.receivedDateTime, $('Fetch Outlook emails').item.json.subject, $('Fetch Outlook emails').item.json.sender.emailAddress.address, $('Fetch Outlook emails').item.json.body.content] }}"
+        }
+      },
+      "position": [
+        1340,
+        200
+      ]
+    },
+    {
+      "name": "Regex parse",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Loads active regex patterns from DB (passed in as $input.first().json.patterns)\n// and attempts to match against the raw email body.\n// Returns parsed fields or null if no pattern matches.\n\nconst body = $('Insert raw event').item.json.body_text || '';\nconst subject = $('Insert raw event').item.json.subject || '';\nconst sender = $('Insert raw event').item.json.sender || '';\nconst rawEventId = $('Insert raw event').item.json.id;\n\n// Patterns are loaded from DB in a previous step (see Load Patterns node)\nconst patterns = $input.first().json.patterns || [];\n\nfor (const p of patterns) {\n  if (p.source !== 'outlook' && p.source !== 'any') continue;\n  if (p.sender && !sender.includes(p.sender)) continue;\n\n  const re = new RegExp(p.pattern, 'i');\n  const match = body.match(re) || subject.match(re);\n  if (!match || !match.groups) continue;\n\n  const g = match.groups;\n  const amount = parseFloat((g.amount || '').replace(/,/g, ''));\n  if (isNaN(amount)) continue;\n\n  return [{\n    json: {\n      raw_event_id: rawEventId,\n      parse_method: 'regex',\n      pattern_name: p.name,\n      utr: g.utr || null,\n      amount,\n      currency: 'INR',\n      direction: g.direction || (p.fields.direction || 'debit'),\n      merchant: (g.merchant || '').trim() || null,\n      account: g.account || null,\n      category_hint: (g.merchant || '').trim().toLowerCase() || null,\n      transaction_time: g.date || $('Fetch Outlook emails').item.json.receivedDateTime,\n      parse_success: true\n    }\n  }];\n}\n\n// No pattern matched\nreturn [{ json: { raw_event_id: rawEventId, parse_success: false } }];\n"
+      },
+      "position": [
+        1560,
+        200
+      ]
+    },
+    {
+      "name": "Parse succeeded?",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.parse_success }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              },
+              "rightValue": true
+            }
+          ]
+        }
+      },
+      "position": [
+        1780,
+        200
+      ]
+    },
+    {
+      "name": "GroqCloud fallback",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headers": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.groqApiKey }}"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "body",
+              "value": "={{ JSON.stringify({ model: 'llama-3.1-8b-instant', messages: [{ role: 'system', content: 'Extract transaction details from the following bank/payment email fragment. Return JSON only with fields: amount (number), currency (string), direction (debit|credit), merchant (string or null), utr (string or null), transaction_time (ISO8601 or null). No explanation.' }, { role: 'user', content: $('Insert raw event').item.json.body_text?.substring(0, 800) }] }) }}"
+            }
+          ]
+        }
+      },
+      "position": [
+        2000,
+        300
+      ]
+    },
+    {
+      "name": "Log GroqCloud call",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO groq_parse_log (raw_event_id, input_fragment, groq_response, parsed_fields) VALUES ($1, $2, $3, $4) RETURNING id",
+        "additionalFields": {
+          "queryParams": "={{ [$json.raw_event_id, $('Insert raw event').item.json.body_text?.substring(0, 800), $json, $json.choices?.[0]?.message?.content] }}"
+        }
+      },
+      "position": [
+        2220,
+        300
+      ]
+    },
+    {
+      "name": "Dedup check",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM dedup_log WHERE utr IS NOT DISTINCT FROM $1 AND amount = $2 AND direction = $3 AND transaction_time = $4::timestamptz AND account IS NOT DISTINCT FROM $5",
+        "additionalFields": {
+          "queryParams": "={{ [$json.utr, $json.amount, $json.direction, $json.transaction_time, $json.account] }}"
+        }
+      },
+      "position": [
+        2000,
+        100
+      ]
+    },
+    {
+      "name": "Is duplicate?",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.length }}",
+              "operator": {
+                "type": "number",
+                "operation": "greaterThan"
+              },
+              "rightValue": 0
+            }
+          ]
+        }
+      },
+      "position": [
+        2220,
+        100
+      ]
+    },
+    {
+      "name": "Write to ezbookkeeping",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "http://ezbookkeeping:8080/api/v1/transactions/add.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headers": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $credentials.ebkApiToken }}"
+            },
+            {
+              "name": "X-Timezone-Name",
+              "value": "Asia/Kolkata"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "body",
+              "value": "={{ JSON.stringify({ type: $json.direction === 'debit' ? 1 : 2, categoryId: $json.ebk_category_id, accountId: $json.ebk_account_id, amount: Math.round($json.amount * 100), comment: $json.merchant, time: new Date($json.transaction_time).getTime() / 1000 }) }}"
+            }
+          ]
+        }
+      },
+      "position": [
+        2440,
+        100
+      ]
+    },
+    {
+      "name": "Log parse failure",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_events (raw_event_id, stage, error_message, raw_payload) VALUES ($1, 'parse', 'No regex pattern matched and GroqCloud fallback unavailable or failed', $2::jsonb)",
+        "additionalFields": {
+          "queryParams": "={{ [$json.raw_event_id, JSON.stringify($json)] }}"
+        }
+      },
+      "position": [
+        2000,
+        500
+      ]
+    },
+    {
+      "name": "Update ebk status",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE parsed_transactions SET ebk_status = 'written', ebk_transaction_id = $1 WHERE id = $2",
+        "additionalFields": {
+          "queryParams": "={{ [$json.data?.id, $('Dedup check').item.json.parsed_transaction_id] }}"
+        }
+      },
+      "position": [
+        2660,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Outlook emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Outlook emails": {
+      "main": [
+        [
+          {
+            "node": "Filter transaction emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter transaction emails": {
+      "main": [
+        [
+          {
+            "node": "Check already ingested",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check already ingested": {
+      "main": [
+        [
+          {
+            "node": "Skip if exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip if exists": {
+      "main": [
+        [
+          {
+            "node": "Insert raw event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Insert raw event": {
+      "main": [
+        [
+          {
+            "node": "Regex parse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Regex parse": {
+      "main": [
+        [
+          {
+            "node": "Parse succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Dedup check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GroqCloud fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GroqCloud fallback": {
+      "main": [
+        [
+          {
+            "node": "Log GroqCloud call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log GroqCloud call": {
+      "main": [
+        [
+          {
+            "node": "Dedup check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedup check": {
+      "main": [
+        [
+          {
+            "node": "Is duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is duplicate?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Write to ezbookkeeping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write to ezbookkeeping": {
+      "main": [
+        [
+          {
+            "node": "Update ebk status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
