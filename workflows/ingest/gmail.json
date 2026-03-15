@@ -1,4 +1,5 @@
 {
+  "id": "gmail-ingest",
   "name": "Finance — Gmail cross-verification ingest",
   "nodes": [
     {
@@ -20,19 +21,43 @@
       ]
     },
     {
+      "name": "Read last sync",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT EXTRACT(EPOCH FROM last_fetched_at)::bigint AS epoch FROM sync_state WHERE source = 'gmail'"
+      },
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
       "name": "Fetch Gmail emails",
       "type": "n8n-nodes-base.gmail",
       "parameters": {
         "operation": "getAll",
         "filters": {
-          "q": "from:(noreply@google.com OR no-reply@steampowered.com OR noreply@swiggy.in OR noreply@zomato.com OR noreply@amazon.in OR donotreply@hdfcbank.com) newer_than:1h"
+          "q": "={{ 'from:(noreply@google.com OR no-reply@steampowered.com OR noreply@swiggy.in OR noreply@zomato.com OR noreply@amazon.in OR donotreply@hdfcbank.com) after:' + $('Read last sync').first().json.epoch }}"
         },
         "options": {
           "format": "full"
         }
       },
       "position": [
-        460,
+        580,
+        300
+      ]
+    },
+    {
+      "name": "Update sync time",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sync_state SET last_fetched_at = NOW(), updated_at = NOW() WHERE source = 'gmail'"
+      },
+      "position": [
+        760,
         300
       ]
     },
@@ -208,6 +233,17 @@
       "main": [
         [
           {
+            "node": "Read last sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read last sync": {
+      "main": [
+        [
+          {
             "node": "Fetch Gmail emails",
             "type": "main",
             "index": 0
@@ -216,6 +252,17 @@
       ]
     },
     "Fetch Gmail emails": {
+      "main": [
+        [
+          {
+            "node": "Update sync time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update sync time": {
       "main": [
         [
           {

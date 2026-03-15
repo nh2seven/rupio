@@ -1,4 +1,5 @@
 {
+  "id": "outlook-ingest",
   "name": "Finance — Outlook transaction ingest",
   "nodes": [
     {
@@ -20,6 +21,18 @@
       ]
     },
     {
+      "name": "Read last sync",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT last_fetched_at FROM sync_state WHERE source = 'outlook'"
+      },
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
       "name": "Fetch Outlook emails",
       "type": "n8n-nodes-base.microsoftOutlook",
       "parameters": {
@@ -27,14 +40,26 @@
         "filters": {
           "folderId": "Inbox",
           "subject": "",
-          "receivedAfter": "={{ $now.minus({ hours: 1 }).toISO() }}"
+          "receivedAfter": "={{ $('Read last sync').first().json.last_fetched_at }}"
         },
         "options": {
           "fields": "subject,sender,body,receivedDateTime,internetMessageId"
         }
       },
       "position": [
-        460,
+        580,
+        300
+      ]
+    },
+    {
+      "name": "Update sync time",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sync_state SET last_fetched_at = NOW(), updated_at = NOW() WHERE source = 'outlook'"
+      },
+      "position": [
+        760,
         300
       ]
     },
@@ -341,6 +366,17 @@
       "main": [
         [
           {
+            "node": "Read last sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read last sync": {
+      "main": [
+        [
+          {
             "node": "Fetch Outlook emails",
             "type": "main",
             "index": 0
@@ -349,6 +385,17 @@
       ]
     },
     "Fetch Outlook emails": {
+      "main": [
+        [
+          {
+            "node": "Update sync time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update sync time": {
       "main": [
         [
           {

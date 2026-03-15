@@ -1,0 +1,245 @@
+{
+  "id": "digest-monthly",
+  "name": "Finance — Monthly digest email",
+  "nodes": [
+    {
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Polls every 15 min. Fires on the 1st of each month after 09:00 IST once the previous month is complete. Catches up on missed months the same way daily/weekly do."
+    },
+    {
+      "name": "Check if monthly digest is due",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (last_fetched_at AT TIME ZONE 'Asia/Kolkata')::date::text AS period_start,\n  ((last_fetched_at AT TIME ZONE 'Asia/Kolkata')::date + INTERVAL '1 month')::date::text AS period_end\nFROM sync_state\nWHERE source = 'digest_monthly'\n  AND NOW() >= (((last_fetched_at AT TIME ZONE 'Asia/Kolkata')::date + INTERVAL '1 month')::timestamp + INTERVAL '9 hours') AT TIME ZONE 'Asia/Kolkata'"
+      },
+      "position": [
+        460,
+        300
+      ],
+      "notes": "last_fetched_at = 1st of next undigested month (midnight IST). Fires when we're past 9am IST on the 1st of the month AFTER that. Postgres INTERVAL '1 month' handles variable month lengths correctly."
+    },
+    {
+      "name": "Query month stats",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (SELECT count(*) FROM raw_events\n   WHERE ingested_at >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND ingested_at < $2::date AT TIME ZONE 'Asia/Kolkata') AS raw_ingested,\n  (SELECT count(*) FROM parsed_transactions\n   WHERE parsed_at >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND parsed_at < $2::date AT TIME ZONE 'Asia/Kolkata'\n     AND ebk_status = 'written') AS written_to_ebk,\n  (SELECT count(*) FROM parsed_transactions\n   WHERE parsed_at >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND parsed_at < $2::date AT TIME ZONE 'Asia/Kolkata'\n     AND parse_method = 'groq') AS groq_calls,\n  (SELECT count(*) FROM failed_events\n   WHERE failed_at >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND failed_at < $2::date AT TIME ZONE 'Asia/Kolkata'\n     AND resolved = FALSE) AS open_failures,\n  (SELECT count(*) FROM dedup_log\n   WHERE first_seen_at >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND first_seen_at < $2::date AT TIME ZONE 'Asia/Kolkata') AS deduplicated,\n  (SELECT COALESCE(SUM(amount),0) FROM parsed_transactions\n   WHERE direction = 'debit'\n     AND transaction_time >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND transaction_time < $2::date AT TIME ZONE 'Asia/Kolkata') AS month_spend,\n  (SELECT COALESCE(SUM(amount),0) FROM parsed_transactions\n   WHERE direction = 'credit'\n     AND transaction_time >= $1::date AT TIME ZONE 'Asia/Kolkata'\n     AND transaction_time < $2::date AT TIME ZONE 'Asia/Kolkata') AS month_received",
+        "additionalFields": {
+          "queryParams": "={{ [$json.period_start, $json.period_end] }}"
+        }
+      },
+      "position": [
+        680,
+        100
+      ]
+    },
+    {
+      "name": "Query weekly breakdown",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  date_trunc('week', transaction_time AT TIME ZONE 'Asia/Kolkata')::date::text AS week_start,\n  (date_trunc('week', transaction_time AT TIME ZONE 'Asia/Kolkata')::date + 6)::text AS week_end,\n  count(*) AS transactions,\n  COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount END), 0) AS spent,\n  COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount END), 0) AS received\nFROM parsed_transactions\nWHERE transaction_time >= $1::date AT TIME ZONE 'Asia/Kolkata'\n  AND transaction_time < $2::date AT TIME ZONE 'Asia/Kolkata'\n  AND ebk_status = 'written'\nGROUP BY 1, 2 ORDER BY 1",
+        "additionalFields": {
+          "queryParams": "={{ [$json.period_start, $json.period_end] }}"
+        }
+      },
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "name": "Query category breakdown",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COALESCE(pt.category_hint, 'uncategorized') AS category,\n  count(*) AS transactions,\n  COALESCE(SUM(pt.amount), 0) AS total\nFROM parsed_transactions pt\nWHERE pt.transaction_time >= $1::date AT TIME ZONE 'Asia/Kolkata'\n  AND pt.transaction_time < $2::date AT TIME ZONE 'Asia/Kolkata'\n  AND pt.direction = 'debit'\n  AND pt.ebk_status = 'written'\nGROUP BY 1 ORDER BY 3 DESC LIMIT 15",
+        "additionalFields": {
+          "queryParams": "={{ [$json.period_start, $json.period_end] }}"
+        }
+      },
+      "position": [
+        680,
+        500
+      ]
+    },
+    {
+      "name": "Query open failures",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT fe.id, fe.stage, fe.error_message, re.subject, re.sender, fe.failed_at FROM failed_events fe LEFT JOIN raw_events re ON fe.raw_event_id = re.id WHERE fe.resolved = FALSE ORDER BY fe.failed_at DESC LIMIT 10"
+      },
+      "position": [
+        680,
+        700
+      ]
+    },
+    {
+      "name": "Build email body",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const period = $('Check if monthly digest is due').first().json;\nconst stats = $('Query month stats').first().json;\nconst weeks = $('Query weekly breakdown').all().map(i => i.json);\nconst categories = $('Query category breakdown').all().map(i => i.json);\nconst failures = $('Query open failures').all().map(i => i.json);\n\nconst fmtINR = n => Number(n).toLocaleString('en-IN', { style: 'currency', currency: 'INR' });\nconst monthLabel = new Date(period.period_start + 'T00:00:00+05:30')\n  .toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });\nconst fmtDate = d => new Date(d + 'T00:00:00+05:30')\n  .toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });\n\nconst weekRows = weeks.length === 0\n  ? '<tr><td colspan=\"4\" style=\"color:#999\">No transactions this month</td></tr>'\n  : weeks.map(w =>\n      `<tr><td>${fmtDate(w.week_start)} – ${fmtDate(w.week_end)}</td><td>${w.transactions}</td><td>${fmtINR(w.spent)}</td><td>${fmtINR(w.received)}</td></tr>`\n    ).join('');\n\nconst catRows = categories.length === 0\n  ? '<tr><td colspan=\"3\" style=\"color:#999\">No spending data</td></tr>'\n  : categories.map(c =>\n      `<tr><td>${c.category}</td><td>${c.transactions}</td><td>${fmtINR(c.total)}</td></tr>`\n    ).join('');\n\nlet failureRows = failures.length === 0\n  ? '<tr><td colspan=\"4\" style=\"color:green\">None — all clear</td></tr>'\n  : failures.map(f =>\n      `<tr><td>${f.id}</td><td>${f.stage}</td><td>${f.subject || '—'}</td><td>${f.error_message?.substring(0, 80) || '—'}</td></tr>`\n    ).join('');\n\nconst html = `\n<html><body style=\"font-family: sans-serif; color: #222; max-width: 700px; margin: auto\">\n<h2>Finance pipeline — monthly digest</h2>\n<p style=\"color: #666\">${monthLabel}</p>\n\n<h3>Month summary</h3>\n<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse; width:100%\">\n  <tr style=\"background:#f0f0f0\"><th>Metric</th><th>Value</th></tr>\n  <tr><td>Emails ingested</td><td>${stats.raw_ingested}</td></tr>\n  <tr><td>Transactions written</td><td>${stats.written_to_ebk}</td></tr>\n  <tr><td>Deduplicated (dropped)</td><td>${stats.deduplicated}</td></tr>\n  <tr><td>GroqCloud fallback calls</td><td>${stats.groq_calls}</td></tr>\n  <tr><td>Open failures</td><td style=\"color:${stats.open_failures > 0 ? 'red' : 'green'}\">${stats.open_failures}</td></tr>\n  <tr><td>Total spent</td><td><strong>${fmtINR(stats.month_spend)}</strong></td></tr>\n  <tr><td>Total received</td><td>${fmtINR(stats.month_received)}</td></tr>\n</table>\n\n<h3>Weekly breakdown</h3>\n<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse; width:100%\">\n  <tr style=\"background:#f0f0f0\"><th>Week</th><th>Transactions</th><th>Spent</th><th>Received</th></tr>\n  ${weekRows}\n</table>\n\n<h3>Spending by category</h3>\n<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse; width:100%\">\n  <tr style=\"background:#f0f0f0\"><th>Category</th><th>Transactions</th><th>Total</th></tr>\n  ${catRows}\n</table>\n\n<h3>Open failures</h3>\n<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse; width:100%\">\n  <tr style=\"background:#f0f0f0\"><th>ID</th><th>Stage</th><th>Email subject</th><th>Error</th></tr>\n  ${failureRows}\n</table>\n\n<p style=\"font-size:12px;color:#999\">To mark a failure resolved: <code>UPDATE failed_events SET resolved=TRUE WHERE id=&lt;id&gt;;</code><br>\nTo promote a Groq pattern to regex: see RUNBOOK.md</p>\n</body></html>\n`;\n\nreturn [{ json: { subject: `Finance monthly digest — ${monthLabel}`, html, period_end: period.period_end } }];\n"
+      },
+      "position": [
+        900,
+        400
+      ]
+    },
+    {
+      "name": "Send email",
+      "type": "n8n-nodes-base.gmail",
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $credentials.digestRecipient }}",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.html }}",
+        "options": {
+          "bodyContentType": "html"
+        }
+      },
+      "position": [
+        1120,
+        400
+      ]
+    },
+    {
+      "name": "Advance digest cursor",
+      "type": "n8n-nodes-base.postgres",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sync_state SET last_fetched_at = $1::date AT TIME ZONE 'Asia/Kolkata', updated_at = NOW() WHERE source = 'digest_monthly'",
+        "additionalFields": {
+          "queryParams": "={{ [$('Build email body').first().json.period_end] }}"
+        }
+      },
+      "position": [
+        1340,
+        400
+      ],
+      "notes": "Advances last_fetched_at by exactly 1 month (to period_end). Next poll will check if another month is pending."
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Check if monthly digest is due",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if monthly digest is due": {
+      "main": [
+        [
+          {
+            "node": "Query month stats",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query weekly breakdown",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query category breakdown",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Query open failures",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query month stats": {
+      "main": [
+        [
+          {
+            "node": "Build email body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query weekly breakdown": {
+      "main": [
+        [
+          {
+            "node": "Build email body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query category breakdown": {
+      "main": [
+        [
+          {
+            "node": "Build email body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query open failures": {
+      "main": [
+        [
+          {
+            "node": "Build email body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build email body": {
+      "main": [
+        [
+          {
+            "node": "Send email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send email": {
+      "main": [
+        [
+          {
+            "node": "Advance digest cursor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
