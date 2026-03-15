@@ -3,13 +3,13 @@ services:
   # ── ezbookkeeping ────────────────────────────────────────────────────────────
   ezbookkeeping:
     image: mayswind/ezbookkeeping:latest
-    container_name: ezbookkeeping
+    container_name: rupio-ebk
     restart: unless-stopped
     ports:
       - "127.0.0.1:7777:8080"
     volumes:
-      - ./ebk/data:/ezbookkeeping/data
-      - ./ebk/storage:/ezbookkeeping/storage
+      - ebk-data:/ezbookkeeping/data
+      - ebk-storage:/ezbookkeeping/storage
     environment:
       - EBK_SERVER_DOMAIN=localhost
       - EBK_SERVER_PORT=8080
@@ -27,14 +27,17 @@ services:
   # ── n8n ──────────────────────────────────────────────────────────────────────
   n8n:
     image: n8nio/n8n:latest
-    container_name: n8n
+    container_name: rupio-n8n
     restart: unless-stopped
+    entrypoint: ["tini", "--"]
+    command: ["sh", "-c", "(sleep 10 && /scripts/import-workflows.sh) & exec /docker-entrypoint.sh"]
     ports:
       - "127.0.0.1:5678:5678"
     volumes:
-      - ./n8n/data:/home/node/.n8n
-      - ./n8n/backups:/backups
-      - ./docs/scripts:/scripts
+      - n8n-data:/home/node/.n8n
+      - n8n-backups:/backups
+      - ./workflows:/workflows:ro
+      - ./scripts:/scripts:ro
     environment:
       - N8N_HOST=localhost
       - N8N_PORT=5678
@@ -59,17 +62,20 @@ services:
   # ── Postgres ─────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
-    container_name: postgres
+    container_name: rupio-db
     restart: unless-stopped
     volumes:
-      - ./db:/docker-entrypoint-initdb.d
-      - ./db/data:/var/lib/postgresql/data
+      - ./db/init/01-init-databases.sh:/docker-entrypoint-initdb.d/01-init-databases.sh:ro
+      - ./db/schemas:/docker-entrypoint-initdb.d/schemas:ro
+      - pg-data:/var/lib/postgresql/data
     environment:
       - POSTGRES_USER=admin
       - POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD}
       - POSTGRES_DB=postgres
+      - POSTGRES_N8N_PASSWORD=${POSTGRES_N8N_PASSWORD}
+      - POSTGRES_FINANCE_PASSWORD=${POSTGRES_FINANCE_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -82,10 +88,10 @@ services:
     container_name: rupio-backup
     restart: unless-stopped
     volumes:
-      - ./n8n/backups:/backups
-      - ./ebk/data:/backups/ebk-source:ro
-      - ./rclone:/root/.config/rclone
-      - ./docs/scripts:/scripts
+      - n8n-backups:/backups
+      - ebk-data:/backups/ebk-source:ro
+      - rclone-config:/root/.config/rclone
+      - ./scripts:/scripts:ro
     environment:
       - PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}
       - POSTGRES_HOST=postgres
@@ -103,6 +109,14 @@ services:
         condition: service_healthy
     networks:
       - rupio
+
+volumes:
+  ebk-data:
+  ebk-storage:
+  n8n-data:
+  n8n-backups:
+  pg-data:
+  rclone-config:
 
 networks:
   rupio:
