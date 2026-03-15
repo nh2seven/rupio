@@ -135,3 +135,26 @@ CREATE TABLE IF NOT EXISTS account_map (
     ebk_account_id  BIGINT NOT NULL,
     notes           TEXT
 );
+
+-- ── sync_state ───────────────────────────────────────────────────────────────
+-- Tracks the last successful fetch timestamp per email source.
+-- Replaces the rolling 1-hour window so the pipeline catches up automatically
+-- after any downtime — if the laptop is off for 8 hours, the first run on
+-- wake fetches all 8 hours of missed emails.
+CREATE TABLE IF NOT EXISTS sync_state (
+    source          TEXT PRIMARY KEY,       -- 'outlook' | 'gmail' | 'digest_daily' | 'digest_weekly' | 'digest_monthly'
+    last_fetched_at TIMESTAMPTZ NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed with safe defaults. Only inserts on first boot.
+-- For digest rows, last_fetched_at is the start of the next period to cover,
+-- stored as midnight IST of that date. Each digest advances it by one period
+-- (1 day or 7 days), so missed periods each get their own email on catch-up.
+INSERT INTO sync_state (source, last_fetched_at) VALUES
+    ('outlook',        NOW() - INTERVAL '1 hour'),
+    ('gmail',          NOW() - INTERVAL '1 hour'),
+    ('digest_daily',   (NOW() AT TIME ZONE 'Asia/Kolkata')::date::timestamp AT TIME ZONE 'Asia/Kolkata'),
+    ('digest_weekly',  date_trunc('week', NOW() AT TIME ZONE 'Asia/Kolkata')::timestamp AT TIME ZONE 'Asia/Kolkata'),
+    ('digest_monthly', date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')::timestamp AT TIME ZONE 'Asia/Kolkata')
+ON CONFLICT (source) DO NOTHING;
